@@ -118,6 +118,7 @@ def filter(f):
 def sort_generics(item):
     if 'generics' in queries:
         return item['brand'] == 'Generic' or item['brand'] == ''
+    return True
 
 def sort():
     data.sort(reverse=True, key=sort_generics)
