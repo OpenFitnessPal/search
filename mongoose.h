@@ -386,6 +386,10 @@ static inline int mg_mkdir(const char *path, mode_t mode) {
 #define MG_PATH_MAX FILENAME_MAX
 #endif
 
+#ifndef MG_ENABLE_POSIX_FS
+#define MG_ENABLE_POSIX_FS 1
+#endif
+
 #endif
 
 
@@ -499,6 +503,10 @@ typedef int socklen_t;
 #define SIGPIPE 0
 #endif
 
+#ifndef MG_ENABLE_POSIX_FS
+#define MG_ENABLE_POSIX_FS 1
+#endif
+
 #endif
 
 
@@ -549,7 +557,6 @@ int sscanf(const char *, const char *, ...);
 
 #include <FreeRTOS_IP.h>
 #include <FreeRTOS_Sockets.h>
-#include <FreeRTOS_errno_TCP.h>  // contents to be moved and file removed, some day
 
 #define MG_SOCKET_TYPE Socket_t
 #define MG_INVALID_SOCKET FREERTOS_INVALID_SOCKET
@@ -581,6 +588,9 @@ int sscanf(const char *, const char *, ...);
 
 #define sockaddr_in freertos_sockaddr
 #define sockaddr freertos_sockaddr
+#if ipFR_TCP_VERSION_MAJOR >= 4
+#define sin_addr sin_address.ulIP_IPv4
+#endif
 #define accept(a, b, c) FreeRTOS_accept((a), (b), (c))
 #define connect(a, b, c) FreeRTOS_connect((a), (b), (c))
 #define bind(a, b, c) FreeRTOS_bind((a), (b), (c))
@@ -780,11 +790,7 @@ struct timeval {
 #endif
 
 #ifndef MG_ENABLE_POSIX_FS
-#if defined(FOPEN_MAX)
-#define MG_ENABLE_POSIX_FS 1
-#else
 #define MG_ENABLE_POSIX_FS 0
-#endif
 #endif
 
 #ifndef MG_INVALID_SOCKET
@@ -1664,6 +1670,111 @@ int mg_uecc_verify(const uint8_t *public_key, const uint8_t *message_hash,
 
 /* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
 
+#ifndef _UECC_TYPES_H_
+#define _UECC_TYPES_H_
+
+#ifndef MG_UECC_PLATFORM
+#if defined(__AVR__) && __AVR__
+#define MG_UECC_PLATFORM mg_uecc_avr
+#elif defined(__thumb2__) || \
+    defined(_M_ARMT) /* I think MSVC only supports Thumb-2 targets */
+#define MG_UECC_PLATFORM mg_uecc_arm_thumb2
+#elif defined(__thumb__)
+#define MG_UECC_PLATFORM mg_uecc_arm_thumb
+#elif defined(__arm__) || defined(_M_ARM)
+#define MG_UECC_PLATFORM mg_uecc_arm
+#elif defined(__aarch64__)
+#define MG_UECC_PLATFORM mg_uecc_arm64
+#elif defined(__i386__) || defined(_M_IX86) || defined(_X86_) || \
+    defined(__I86__)
+#define MG_UECC_PLATFORM mg_uecc_x86
+#elif defined(__amd64__) || defined(_M_X64)
+#define MG_UECC_PLATFORM mg_uecc_x86_64
+#else
+#define MG_UECC_PLATFORM mg_uecc_arch_other
+#endif
+#endif
+
+#ifndef MG_UECC_ARM_USE_UMAAL
+#if (MG_UECC_PLATFORM == mg_uecc_arm) && (__ARM_ARCH >= 6)
+#define MG_UECC_ARM_USE_UMAAL 1
+#elif (MG_UECC_PLATFORM == mg_uecc_arm_thumb2) && (__ARM_ARCH >= 6) && \
+    (!defined(__ARM_ARCH_7M__) || !__ARM_ARCH_7M__)
+#define MG_UECC_ARM_USE_UMAAL 1
+#else
+#define MG_UECC_ARM_USE_UMAAL 0
+#endif
+#endif
+
+#ifndef MG_UECC_WORD_SIZE
+#if MG_UECC_PLATFORM == mg_uecc_avr
+#define MG_UECC_WORD_SIZE 1
+#elif (MG_UECC_PLATFORM == mg_uecc_x86_64 || MG_UECC_PLATFORM == mg_uecc_arm64)
+#define MG_UECC_WORD_SIZE 8
+#else
+#define MG_UECC_WORD_SIZE 4
+#endif
+#endif
+
+#if (MG_UECC_WORD_SIZE != 1) && (MG_UECC_WORD_SIZE != 4) && \
+    (MG_UECC_WORD_SIZE != 8)
+#error "Unsupported value for MG_UECC_WORD_SIZE"
+#endif
+
+#if ((MG_UECC_PLATFORM == mg_uecc_avr) && (MG_UECC_WORD_SIZE != 1))
+#pragma message("MG_UECC_WORD_SIZE must be 1 for AVR")
+#undef MG_UECC_WORD_SIZE
+#define MG_UECC_WORD_SIZE 1
+#endif
+
+#if ((MG_UECC_PLATFORM == mg_uecc_arm ||         \
+      MG_UECC_PLATFORM == mg_uecc_arm_thumb ||   \
+      MG_UECC_PLATFORM == mg_uecc_arm_thumb2) && \
+     (MG_UECC_WORD_SIZE != 4))
+#pragma message("MG_UECC_WORD_SIZE must be 4 for ARM")
+#undef MG_UECC_WORD_SIZE
+#define MG_UECC_WORD_SIZE 4
+#endif
+
+typedef int8_t wordcount_t;
+typedef int16_t bitcount_t;
+typedef int8_t cmpresult_t;
+
+#if (MG_UECC_WORD_SIZE == 1)
+
+typedef uint8_t mg_uecc_word_t;
+typedef uint16_t mg_uecc_dword_t;
+
+#define HIGH_BIT_SET 0x80
+#define MG_UECC_WORD_BITS 8
+#define MG_UECC_WORD_BITS_SHIFT 3
+#define MG_UECC_WORD_BITS_MASK 0x07
+
+#elif (MG_UECC_WORD_SIZE == 4)
+
+typedef uint32_t mg_uecc_word_t;
+typedef uint64_t mg_uecc_dword_t;
+
+#define HIGH_BIT_SET 0x80000000
+#define MG_UECC_WORD_BITS 32
+#define MG_UECC_WORD_BITS_SHIFT 5
+#define MG_UECC_WORD_BITS_MASK 0x01F
+
+#elif (MG_UECC_WORD_SIZE == 8)
+
+typedef uint64_t mg_uecc_word_t;
+
+#define HIGH_BIT_SET 0x8000000000000000U
+#define MG_UECC_WORD_BITS 64
+#define MG_UECC_WORD_BITS_SHIFT 6
+#define MG_UECC_WORD_BITS_MASK 0x03F
+
+#endif /* MG_UECC_WORD_SIZE */
+
+#endif /* _UECC_TYPES_H_ */
+
+/* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
+
 #ifndef _UECC_VLI_H_
 #define _UECC_VLI_H_
 
@@ -1830,110 +1941,6 @@ int mg_uecc_generate_random_int(mg_uecc_word_t *random,
 
 #endif /* _UECC_VLI_H_ */
 
-/* Copyright 2015, Kenneth MacKay. Licensed under the BSD 2-clause license. */
-
-#ifndef _UECC_TYPES_H_
-#define _UECC_TYPES_H_
-
-#ifndef MG_UECC_PLATFORM
-#if defined(__AVR__) && __AVR__
-#define MG_UECC_PLATFORM mg_uecc_avr
-#elif defined(__thumb2__) || \
-    defined(_M_ARMT) /* I think MSVC only supports Thumb-2 targets */
-#define MG_UECC_PLATFORM mg_uecc_arm_thumb2
-#elif defined(__thumb__)
-#define MG_UECC_PLATFORM mg_uecc_arm_thumb
-#elif defined(__arm__) || defined(_M_ARM)
-#define MG_UECC_PLATFORM mg_uecc_arm
-#elif defined(__aarch64__)
-#define MG_UECC_PLATFORM mg_uecc_arm64
-#elif defined(__i386__) || defined(_M_IX86) || defined(_X86_) || \
-    defined(__I86__)
-#define MG_UECC_PLATFORM mg_uecc_x86
-#elif defined(__amd64__) || defined(_M_X64)
-#define MG_UECC_PLATFORM mg_uecc_x86_64
-#else
-#define MG_UECC_PLATFORM mg_uecc_arch_other
-#endif
-#endif
-
-#ifndef MG_UECC_ARM_USE_UMAAL
-#if (MG_UECC_PLATFORM == mg_uecc_arm) && (__ARM_ARCH >= 6)
-#define MG_UECC_ARM_USE_UMAAL 1
-#elif (MG_UECC_PLATFORM == mg_uecc_arm_thumb2) && (__ARM_ARCH >= 6) && \
-    (!defined(__ARM_ARCH_7M__) || !__ARM_ARCH_7M__)
-#define MG_UECC_ARM_USE_UMAAL 1
-#else
-#define MG_UECC_ARM_USE_UMAAL 0
-#endif
-#endif
-
-#ifndef MG_UECC_WORD_SIZE
-#if MG_UECC_PLATFORM == mg_uecc_avr
-#define MG_UECC_WORD_SIZE 1
-#elif (MG_UECC_PLATFORM == mg_uecc_x86_64 || MG_UECC_PLATFORM == mg_uecc_arm64)
-#define MG_UECC_WORD_SIZE 8
-#else
-#define MG_UECC_WORD_SIZE 4
-#endif
-#endif
-
-#if (MG_UECC_WORD_SIZE != 1) && (MG_UECC_WORD_SIZE != 4) && \
-    (MG_UECC_WORD_SIZE != 8)
-#error "Unsupported value for MG_UECC_WORD_SIZE"
-#endif
-
-#if ((MG_UECC_PLATFORM == mg_uecc_avr) && (MG_UECC_WORD_SIZE != 1))
-#pragma message("MG_UECC_WORD_SIZE must be 1 for AVR")
-#undef MG_UECC_WORD_SIZE
-#define MG_UECC_WORD_SIZE 1
-#endif
-
-#if ((MG_UECC_PLATFORM == mg_uecc_arm ||         \
-      MG_UECC_PLATFORM == mg_uecc_arm_thumb ||   \
-      MG_UECC_PLATFORM == mg_uecc_arm_thumb2) && \
-     (MG_UECC_WORD_SIZE != 4))
-#pragma message("MG_UECC_WORD_SIZE must be 4 for ARM")
-#undef MG_UECC_WORD_SIZE
-#define MG_UECC_WORD_SIZE 4
-#endif
-
-typedef int8_t wordcount_t;
-typedef int16_t bitcount_t;
-typedef int8_t cmpresult_t;
-
-#if (MG_UECC_WORD_SIZE == 1)
-
-typedef uint8_t mg_uecc_word_t;
-typedef uint16_t mg_uecc_dword_t;
-
-#define HIGH_BIT_SET 0x80
-#define MG_UECC_WORD_BITS 8
-#define MG_UECC_WORD_BITS_SHIFT 3
-#define MG_UECC_WORD_BITS_MASK 0x07
-
-#elif (MG_UECC_WORD_SIZE == 4)
-
-typedef uint32_t mg_uecc_word_t;
-typedef uint64_t mg_uecc_dword_t;
-
-#define HIGH_BIT_SET 0x80000000
-#define MG_UECC_WORD_BITS 32
-#define MG_UECC_WORD_BITS_SHIFT 5
-#define MG_UECC_WORD_BITS_MASK 0x01F
-
-#elif (MG_UECC_WORD_SIZE == 8)
-
-typedef uint64_t mg_uecc_word_t;
-
-#define HIGH_BIT_SET 0x8000000000000000U
-#define MG_UECC_WORD_BITS 64
-#define MG_UECC_WORD_BITS_SHIFT 6
-#define MG_UECC_WORD_BITS_MASK 0x03F
-
-#endif /* MG_UECC_WORD_SIZE */
-
-#endif /* _UECC_TYPES_H_ */
 // End of uecc BSD-2
 // portable8439 v1.0.1
 // Source: https://github.com/DavyLandman/portable8439
@@ -1963,11 +1970,11 @@ extern "C" {
  if possible, carefully pick your associated data.
 */
 
-// Make sure we are either nested in C++ or running in a C99+ compiler
+/* Make sure we are either nested in C++ or running in a C99+ compiler
 #if !defined(__cplusplus) && !defined(_MSC_VER) && \
     (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 199901L)
 #error "C99 or newer required"
-#endif
+#endif */
 
 // #if CHAR_BIT > 8
 // #    error "Systems without native octals not suppoted"
@@ -2154,6 +2161,7 @@ struct mg_connection {
   unsigned is_resp : 1;        // Response is still being generated
   unsigned is_readable : 1;    // Connection is ready to read
   unsigned is_writable : 1;    // Connection is ready to write
+  unsigned is_io_err : 1;      // Remember IO_ERR condition for later use
 };
 
 void mg_mgr_poll(struct mg_mgr *, int ms);
@@ -3048,50 +3056,22 @@ struct mg_tcpip_driver_tm4c_data {
 #define MG_DRIVER_MDC_CR 1
 #endif
 
-#endif
-
-
-#if MG_ENABLE_TCPIP && defined(MG_ENABLE_DRIVER_W5500) && MG_ENABLE_DRIVER_W5500
-
-#undef MG_ENABLE_TCPIP_DRIVER_INIT
-#define MG_ENABLE_TCPIP_DRIVER_INIT 0
-
-#endif
-
-
-#if MG_ENABLE_TCPIP && defined(MG_ENABLE_DRIVER_XMC7) && MG_ENABLE_DRIVER_XMC7
-
-struct mg_tcpip_driver_xmc7_data {
-  int mdc_cr;  // Valid values: -1, 0, 1, 2, 3, 4, 5
-  uint8_t phy_addr;
-};
-
-#ifndef MG_TCPIP_PHY_ADDR
-#define MG_TCPIP_PHY_ADDR 0
-#endif
-
-#ifndef MG_DRIVER_MDC_CR
-#define MG_DRIVER_MDC_CR 3
-#endif
-
-#define MG_TCPIP_DRIVER_INIT(mgr)                                 \
-  do {                                                            \
-    static struct mg_tcpip_driver_xmc7_data driver_data_;       \
-    static struct mg_tcpip_if mif_;                               \
-    driver_data_.mdc_cr = MG_DRIVER_MDC_CR;                       \
-    driver_data_.phy_addr = MG_TCPIP_PHY_ADDR;                    \
-    mif_.ip = MG_TCPIP_IP;                                        \
-    mif_.mask = MG_TCPIP_MASK;                                    \
-    mif_.gw = MG_TCPIP_GW;                                        \
-    mif_.driver = &mg_tcpip_driver_xmc7;                        \
-    mif_.driver_data = &driver_data_;                             \
-    MG_SET_MAC_ADDRESS(mif_.mac);                                 \
-    mg_tcpip_init(mgr, &mif_);                                    \
-    MG_INFO(("Driver: xmc7, MAC: %M", mg_print_mac, mif_.mac)); \
+#define MG_TCPIP_DRIVER_INIT(mgr)                               \
+  do {                                                          \
+    static struct mg_tcpip_driver_tm4c_data driver_data_;       \
+    static struct mg_tcpip_if mif_;                             \
+    driver_data_.mdc_cr = MG_DRIVER_MDC_CR;                     \
+    mif_.ip = MG_TCPIP_IP;                                      \
+    mif_.mask = MG_TCPIP_MASK;                                  \
+    mif_.gw = MG_TCPIP_GW;                                      \
+    mif_.driver = &mg_tcpip_driver_tm4c;                        \
+    mif_.driver_data = &driver_data_;                           \
+    MG_SET_MAC_ADDRESS(mif_.mac);                               \
+    mg_tcpip_init(mgr, &mif_);                                  \
+    MG_INFO(("Driver: tm4c, MAC: %M", mg_print_mac, mif_.mac)); \
   } while (0)
 
 #endif
-
 
 
 #if MG_ENABLE_TCPIP && defined(MG_ENABLE_DRIVER_XMC) && MG_ENABLE_DRIVER_XMC
@@ -3139,6 +3119,41 @@ struct mg_tcpip_driver_xmc_data {
   } while (0)
 
 #endif
+
+
+#if MG_ENABLE_TCPIP && defined(MG_ENABLE_DRIVER_XMC7) && MG_ENABLE_DRIVER_XMC7
+
+struct mg_tcpip_driver_xmc7_data {
+  int mdc_cr;  // Valid values: -1, 0, 1, 2, 3, 4, 5
+  uint8_t phy_addr;
+};
+
+#ifndef MG_TCPIP_PHY_ADDR
+#define MG_TCPIP_PHY_ADDR 0
+#endif
+
+#ifndef MG_DRIVER_MDC_CR
+#define MG_DRIVER_MDC_CR 3
+#endif
+
+#define MG_TCPIP_DRIVER_INIT(mgr)                                 \
+  do {                                                            \
+    static struct mg_tcpip_driver_xmc7_data driver_data_;       \
+    static struct mg_tcpip_if mif_;                               \
+    driver_data_.mdc_cr = MG_DRIVER_MDC_CR;                       \
+    driver_data_.phy_addr = MG_TCPIP_PHY_ADDR;                    \
+    mif_.ip = MG_TCPIP_IP;                                        \
+    mif_.mask = MG_TCPIP_MASK;                                    \
+    mif_.gw = MG_TCPIP_GW;                                        \
+    mif_.driver = &mg_tcpip_driver_xmc7;                        \
+    mif_.driver_data = &driver_data_;                             \
+    MG_SET_MAC_ADDRESS(mif_.mac);                                 \
+    mg_tcpip_init(mgr, &mif_);                                    \
+    MG_INFO(("Driver: xmc7, MAC: %M", mg_print_mac, mif_.mac)); \
+  } while (0)
+
+#endif
+
 
 #ifdef __cplusplus
 }

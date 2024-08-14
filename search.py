@@ -126,6 +126,8 @@ def sort():
 i = 0
 idx = 0
 while i < 10:
+    if idx >= len(results):
+        break
     f = results[idx]
     idx += 1
 

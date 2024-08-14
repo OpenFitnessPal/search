@@ -2853,7 +2853,6 @@ void mg_http_serve_file(struct mg_connection *c, struct mg_http_message *hm,
               etag, (uint64_t) cl, gzip ? "Content-Encoding: gzip\r\n" : "",
               range, opts->extra_headers ? opts->extra_headers : "");
     if (mg_strcasecmp(hm->method, mg_str("HEAD")) == 0) {
-      c->is_draining = 1;
       c->is_resp = 0;
       mg_fs_close(fd);
     } else {
@@ -3216,7 +3215,9 @@ static int skip_chunk(const char *buf, int len, int *pl, int *dl) {
 }
 
 static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
-  if (ev == MG_EV_READ || ev == MG_EV_CLOSE) {
+  if (ev == MG_EV_READ || ev == MG_EV_CLOSE ||
+      (ev == MG_EV_POLL && c->is_accepted && !c->is_draining &&
+       c->recv.len > 0)) {  // see #2796
     struct mg_http_message hm;
     size_t ofs = 0;  // Parsing offset
     while (c->is_resp == 0 && ofs < c->recv.len) {
@@ -3257,6 +3258,7 @@ static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
           // contain a Content-length header. Other requests can also contain a
           // body, but their content has no defined semantics (RFC 7231)
           require_content_len = true;
+          ofs += (size_t) n;  // this request has been processed
         } else if (is_response) {
           // HTTP spec 7.2 Entity body: All other responses must include a body
           // or Content-Length header field defined with a value of 0.
@@ -3299,6 +3301,13 @@ static void http_cb(struct mg_connection *c, int ev, void *ev_data) {
 
       if (c->is_accepted) c->is_resp = 1;  // Start generating response
       mg_call(c, MG_EV_HTTP_MSG, &hm);     // User handler can clear is_resp
+      if (c->is_accepted) {
+        struct mg_str *cc = mg_http_get_header(&hm, "Connection");
+        if (cc != NULL && mg_strcasecmp(*cc, mg_str("close")) == 0) {
+          c->is_draining = 1;  // honor "Connection: close"
+          break;
+        }
+      }
     }
     if (ofs > 0) mg_iobuf_del(&c->recv, 0, ofs);  // Delete processed data
   }
@@ -5108,7 +5117,7 @@ static void onstatechange(struct mg_tcpip_if *ifp) {
     MG_INFO(("READY, IP: %M", mg_print_ip4, &ifp->ip));
     MG_INFO(("       GW: %M", mg_print_ip4, &ifp->gw));
     MG_INFO(("      MAC: %M", mg_print_mac, &ifp->mac));
-    arp_ask(ifp, ifp->gw);
+    arp_ask(ifp, ifp->gw);  // unsolicited GW ARP request
   } else if (ifp->state == MG_TCPIP_STATE_UP) {
     MG_ERROR(("Link up"));
     srand((unsigned int) mg_millis());
@@ -5648,6 +5657,7 @@ static void rx_tcp(struct mg_tcpip_if *ifp, struct pkt *pkt) {
     c->is_connecting = 0;  // Client connected
     settmout(c, MIP_TTYPE_KEEPALIVE);
     mg_call(c, MG_EV_CONNECT, NULL);  // Let user know
+    if (c->is_tls_hs) mg_tls_handshake(c);
   } else if (c != NULL && c->is_connecting && pkt->tcp->flags != TH_ACK) {
     // mg_hexdump(pkt->raw.buf, pkt->raw.len);
     tx_tcp_pkt(ifp, pkt, TH_RST | TH_ACK, pkt->tcp->ack, NULL, 0);
@@ -5956,7 +5966,8 @@ void mg_connect_resolved(struct mg_connection *c) {
   if (c->is_udp && (rem_ip == 0xffffffff || rem_ip == (ifp->ip | ~ifp->mask))) {
     struct connstate *s = (struct connstate *) (c + 1);
     memset(s->mac, 0xFF, sizeof(s->mac));  // global or local broadcast
-  } else if (ifp->ip && ((rem_ip & ifp->mask) == (ifp->ip & ifp->mask))) {
+  } else if (ifp->ip && ((rem_ip & ifp->mask) == (ifp->ip & ifp->mask)) &&
+             rem_ip != ifp->gw) {  // skip if gw (onstatechange -> READY -> ARP)
     // If we're in the same LAN, fire an ARP lookup.
     MG_DEBUG(("%lu ARP lookup...", c->id));
     arp_ask(ifp, rem_ip);
@@ -7513,17 +7524,27 @@ static void read_conn(struct mg_connection *c) {
     size_t len = c->recv.size - c->recv.len;
     long n = -1;
     if (c->is_tls) {
-      if (!ioalloc(c, &c->rtls)) return;
-      n = recv_raw(c, (char *) &c->rtls.buf[c->rtls.len],
-                   c->rtls.size - c->rtls.len);
-      if (n == MG_IO_ERR && c->rtls.len == 0) {
-        // Close only if we have fully drained both raw (rtls) and TLS buffers
-        c->is_closing = 1;
-      } else {
-        if (n > 0) c->rtls.len += (size_t) n;
-        if (c->is_tls_hs) mg_tls_handshake(c);
-        n = c->is_tls_hs ? (long) MG_IO_WAIT : mg_tls_recv(c, buf, len);
+      // Do not read to the raw TLS buffer if it already has enough.
+      // This is to prevent overflowing c->rtls if our reads are slow
+      if (c->rtls.len < 16 * 1024 + 40) {  // TLS record, header, MAC, padding
+        if (!ioalloc(c, &c->rtls)) return;
+        n = recv_raw(c, (char *) &c->rtls.buf[c->rtls.len],
+                     c->rtls.size - c->rtls.len);
+        if (n == MG_IO_ERR) {
+          if (c->rtls.len == 0 || c->is_io_err) {
+            // Close only when we have fully drained both rtls and TLS buffers
+            c->is_closing = 1;  // or there's nothing we can do about it.
+          } else {  // TLS buffer is capped to max record size, mark and
+            c->is_io_err = 1;  // give TLS a chance to process that.
+          }
+        } else {
+          if (n > 0) c->rtls.len += (size_t) n;
+          if (c->is_tls_hs) mg_tls_handshake(c);
+        }
       }
+      n = c->is_tls_hs    ? (long) MG_IO_WAIT
+          : c->is_closing ? -1
+                          : mg_tls_recv(c, buf, len);
     } else {
       n = recv_raw(c, buf, len);
     }
@@ -7590,8 +7611,9 @@ static void setsockopts(struct mg_connection *c) {
 
 void mg_connect_resolved(struct mg_connection *c) {
   int type = c->is_udp ? SOCK_DGRAM : SOCK_STREAM;
+  int proto = type == SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP;
   int rc, af = c->rem.is_ip6 ? AF_INET6 : AF_INET;  // c->rem has resolved IP
-  c->fd = S2PTR(socket(af, type, 0));               // Create outbound socket
+  c->fd = S2PTR(socket(af, type, proto));           // Create outbound socket
   c->is_resolving = 0;                              // Clear resolving flag
   if (FD(c) == MG_INVALID_SOCKET) {
     mg_error(c, "socket(): %d", MG_SOCK_ERR(-1));
@@ -7744,15 +7766,15 @@ static void mg_iotest(struct mg_mgr *mgr, int ms) {
   n = 0;
   for (struct mg_connection *c = mgr->conns; c != NULL; c = c->next) {
     c->is_readable = c->is_writable = 0;
+    if (c->is_closing) ms = 1;
     if (skip_iotest(c)) {
       // Socket not valid, ignore
-    } else if (c->rtls.len > 0 || mg_tls_pending(c) > 0) {
-      ms = 1;  // Don't wait if TLS is ready
     } else {
+      // Don't wait if TLS is ready
+      if (c->rtls.len > 0 || mg_tls_pending(c) > 0) ms = 1;
       fds[n].fd = FD(c);
       if (can_read(c)) fds[n].events |= POLLIN;
       if (can_write(c)) fds[n].events |= POLLOUT;
-      if (c->is_closing) ms = 1;
       n++;
     }
   }
@@ -7768,8 +7790,6 @@ static void mg_iotest(struct mg_mgr *mgr, int ms) {
   for (struct mg_connection *c = mgr->conns; c != NULL; c = c->next) {
     if (skip_iotest(c)) {
       // Socket not valid, ignore
-    } else if (c->rtls.len > 0 || mg_tls_pending(c) > 0) {
-      c->is_readable = 1;
     } else {
       if (fds[n].revents & POLLERR) {
         mg_error(c, "socket error");
@@ -7801,7 +7821,7 @@ static void mg_iotest(struct mg_mgr *mgr, int ms) {
     if (can_write(c)) FD_SET(FD(c), &wset);
     if (c->rtls.len > 0 || mg_tls_pending(c) > 0) tvp = &tv_zero;
     if (FD(c) > maxfd) maxfd = FD(c);
-    if (c->is_closing) ms = 1;
+    if (c->is_closing) tvp = &tv_zero;
   }
 
   if ((rc = select((int) maxfd + 1, &rset, &wset, &eset, tvp)) < 0) {
@@ -7837,8 +7857,8 @@ static bool mg_socketpair(MG_SOCKET_TYPE sp[2], union usa usa[2]) {
   *(uint32_t *) &usa->sin.sin_addr = mg_htonl(0x7f000001U);  // 127.0.0.1
   usa[1] = usa[0];
 
-  if ((sp[0] = socket(AF_INET, SOCK_DGRAM, 0)) != MG_INVALID_SOCKET &&
-      (sp[1] = socket(AF_INET, SOCK_DGRAM, 0)) != MG_INVALID_SOCKET &&
+  if ((sp[0] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) != MG_INVALID_SOCKET &&
+      (sp[1] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) != MG_INVALID_SOCKET &&
       bind(sp[0], &usa[0].sa, n) == 0 &&          //
       bind(sp[1], &usa[1].sa, n) == 0 &&          //
       getsockname(sp[0], &usa[0].sa, &n) == 0 &&  //
@@ -7981,7 +8001,7 @@ static char *mg_ssi(const char *path, const char *root, int depth) {
       if (intag && ch == '>' && buf[len - 1] == '-' && buf[len - 2] == '-') {
         buf[len++] = (char) (ch & 0xff);
         buf[len] = '\0';
-        if (sscanf(buf, "<!--#include file=\"%[^\"]", arg)) {
+        if (sscanf(buf, "<!--#include file=\"%[^\"]", arg) > 0) {
           char tmp[MG_PATH_MAX + MG_SSI_BUFSIZ + 10],
               *p = (char *) path + strlen(path), *data;
           while (p > path && p[-1] != MG_DIRSEP && p[-1] != '/') p--;
@@ -7993,7 +8013,7 @@ static char *mg_ssi(const char *path, const char *root, int depth) {
           } else {
             MG_ERROR(("%s: file=%s error or too deep", path, arg));
           }
-        } else if (sscanf(buf, "<!--#include virtual=\"%[^\"]", arg)) {
+        } else if (sscanf(buf, "<!--#include virtual=\"%[^\"]", arg) > 0) {
           char tmp[MG_PATH_MAX + MG_SSI_BUFSIZ + 10], *data;
           mg_snprintf(tmp, sizeof(tmp), "%s%s", root, arg);
           if (depth < MG_MAX_SSI_DEPTH &&
@@ -8129,7 +8149,9 @@ bool mg_match(struct mg_str s, struct mg_str p, struct mg_str *caps) {
   size_t i = 0, j = 0, ni = 0, nj = 0;
   if (caps) caps->buf = NULL, caps->len = 0;
   while (i < p.len || j < s.len) {
-    if (i < p.len && j < s.len && (p.buf[i] == '?' || s.buf[j] == p.buf[i])) {
+    if (i < p.len && j < s.len &&
+        (p.buf[i] == '?' ||
+         (p.buf[i] != '*' && p.buf[i] != '#' && s.buf[j] == p.buf[i]))) {
       if (caps == NULL) {
       } else if (p.buf[i] == '?') {
         caps->buf = &s.buf[j], caps->len = 1;     // Finalize `?` cap
@@ -8172,10 +8194,10 @@ bool mg_span(struct mg_str s, struct mg_str *a, struct mg_str *b, char sep) {
 
 bool mg_str_to_num(struct mg_str str, int base, void *val, size_t val_len) {
   size_t i = 0, ndigits = 0;
-  uint64_t max = val_len == sizeof(uint8_t)   ? 0xFF
+  uint64_t max = val_len == sizeof(uint8_t)    ? 0xFF
                  : val_len == sizeof(uint16_t) ? 0xFFFF
                  : val_len == sizeof(uint32_t) ? 0xFFFFFFFF
-                                : (uint64_t) ~0;
+                                               : (uint64_t) ~0;
   uint64_t result = 0;
   if (max == (uint64_t) ~0 && val_len != sizeof(uint64_t)) return false;
   if (base == 0 && str.len >= 2) {
@@ -8191,7 +8213,7 @@ bool mg_str_to_num(struct mg_str str, int base, void *val, size_t val_len) {
     case 2:
       while (i < str.len && (str.buf[i] == '0' || str.buf[i] == '1')) {
         uint64_t digit = (uint64_t) (str.buf[i] - '0');
-        if (result > max/2) return false;  // Overflow
+        if (result > max / 2) return false;  // Overflow
         result *= 2;
         if (result > max - digit) return false;  // Overflow
         result += digit;
@@ -8201,12 +8223,12 @@ bool mg_str_to_num(struct mg_str str, int base, void *val, size_t val_len) {
     case 10:
       while (i < str.len && str.buf[i] >= '0' && str.buf[i] <= '9') {
         uint64_t digit = (uint64_t) (str.buf[i] - '0');
-        if (result > max/10) return false;  // Overflow
+        if (result > max / 10) return false;  // Overflow
         result *= 10;
         if (result > max - digit) return false;  // Overflow
         result += digit;
         i++, ndigits++;
-    }
+      }
       break;
     case 16:
       while (i < str.len) {
@@ -8216,7 +8238,7 @@ bool mg_str_to_num(struct mg_str str, int base, void *val, size_t val_len) {
                          : (c >= 'a' && c <= 'f') ? (uint64_t) (c - 'W')
                                                   : (uint64_t) ~0;
         if (digit == (uint64_t) ~0) break;
-        if (result > max/16) return false;  // Overflow
+        if (result > max / 16) return false;  // Overflow
         result *= 16;
         if (result > max - digit) return false;  // Overflow
         result += digit;
@@ -9486,9 +9508,9 @@ struct tls_data {
   enum mg_tls_hs_state state;  // keep track of connection handshake progress
 
   struct mg_iobuf send;  // For the receive path, we're reusing c->rtls
-  struct mg_iobuf recv;  // While c->rtls contains full records, recv reuses
-                         // the same underlying buffer but points at individual
-                         // decrypted messages
+  size_t recv_offset;    // While c->rtls contains full records, reuse that
+  size_t recv_len;       // buffer but point at individual decrypted messages
+
   uint8_t content_type;  // Last received record content type
 
   mg_sha256_ctx sha256;  // incremental SHA-256 hash for TLS handshake
@@ -9517,7 +9539,7 @@ struct tls_data {
 #define MG_STORE_BE16(p, n)           \
   do {                                \
     MG_U8P(p)[0] = ((n) >> 8U) & 255; \
-    MG_U8P(p)[1] = (n) & 255;         \
+    MG_U8P(p)[1] = (n) &255;          \
   } while (0)
 
 #define TLS_RECHDR_SIZE 5  // 1 byte type, 2 bytes version, 2 bytes length
@@ -9528,20 +9550,25 @@ struct tls_data {
 static void mg_ssl_key_log(const char *label, uint8_t client_random[32],
                            uint8_t *secret, size_t secretsz) {
   char *keylogfile = getenv("SSLKEYLOGFILE");
-  if (keylogfile == NULL) {
-    return;
+  size_t i;
+  if (keylogfile != NULL) {
+    MG_DEBUG(("Dumping key log into %s", keylogfile));
+    FILE *f = fopen(keylogfile, "a");
+    if (f != NULL) {
+      fprintf(f, "%s ", label);
+      for (i = 0; i < 32; i++) {
+        fprintf(f, "%02x", client_random[i]);
+      }
+      fprintf(f, " ");
+      for (i = 0; i < secretsz; i++) {
+        fprintf(f, "%02x", secret[i]);
+      }
+      fprintf(f, "\n");
+      fclose(f);
+    } else {
+      MG_ERROR(("Cannot open %s", keylogfile));
+    }
   }
-  FILE *f = fopen(keylogfile, "a");
-  fprintf(f, "%s ", label);
-  for (int i = 0; i < 32; i++) {
-    fprintf(f, "%02x", client_random[i]);
-  }
-  fprintf(f, " ");
-  for (unsigned int i = 0; i < secretsz; i++) {
-    fprintf(f, "%02x", secret[i]);
-  }
-  fprintf(f, "\n");
-  fclose(f);
 }
 #endif
 
@@ -9630,14 +9657,17 @@ static void mg_tls_drop_record(struct mg_connection *c) {
 static void mg_tls_drop_message(struct mg_connection *c) {
   uint32_t len;
   struct tls_data *tls = (struct tls_data *) c->tls;
-  if (tls->recv.len == 0) {
+  unsigned char *recv_buf = &c->rtls.buf[tls->recv_offset];
+  if (tls->recv_len == 0) return;
+  len = MG_LOAD_BE24(recv_buf + 1) + TLS_MSGHDR_SIZE;
+  if (tls->recv_len < len) {
+    mg_error(c, "wrong size");
     return;
   }
-  len = MG_LOAD_BE24(tls->recv.buf + 1);
-  mg_sha256_update(&tls->sha256, tls->recv.buf, len + TLS_MSGHDR_SIZE);
-  tls->recv.buf += len + TLS_MSGHDR_SIZE;
-  tls->recv.len -= len + TLS_MSGHDR_SIZE;
-  if (tls->recv.len == 0) {
+  mg_sha256_update(&tls->sha256, recv_buf, len);
+  tls->recv_offset += len;
+  tls->recv_len -= len;
+  if (tls->recv_len == 0) {
     mg_tls_drop_record(c);
   }
 }
@@ -9806,7 +9836,7 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
   nonce[8] ^= (uint8_t) ((seq >> 24) & 255U);
   nonce[9] ^= (uint8_t) ((seq >> 16) & 255U);
   nonce[10] ^= (uint8_t) ((seq >> 8) & 255U);
-  nonce[11] ^= (uint8_t) ((seq) & 255U);
+  nonce[11] ^= (uint8_t) ((seq) &255U);
 
   mg_iobuf_add(wio, wio->len, hdr, sizeof(hdr));
   mg_iobuf_resize(wio, wio->len + encsz);
@@ -9816,11 +9846,19 @@ static void mg_tls_encrypt(struct mg_connection *c, const uint8_t *msg,
   outmsg[msgsz] = msgtype;
 #if CHACHA20
   (void) tag;  // tag is only used in aes gcm
-  uint8_t enc[8192];
-  size_t n =
-      mg_chacha20_poly1305_encrypt(enc, key, nonce, associated_data,
-                                   sizeof(associated_data), outmsg, msgsz + 1);
-  memmove(outmsg, enc, n);
+  {
+    uint8_t *enc = (uint8_t *) malloc(8192);
+    if (enc == NULL) {
+      mg_error(c, "TLS OOM");
+      return;
+    } else {
+      size_t n = mg_chacha20_poly1305_encrypt(enc, key, nonce, associated_data,
+                                              sizeof(associated_data), outmsg,
+                                              msgsz + 1);
+      memmove(outmsg, enc, n);
+      free(enc);
+    }
+  }
 #else
   mg_aes_gcm_encrypt(outmsg, outmsg, msgsz + 1, key, 16, nonce, sizeof(nonce),
                      associated_data, sizeof(associated_data), tag, 16);
@@ -9844,7 +9882,7 @@ static int mg_tls_recv_record(struct mg_connection *c) {
   uint8_t *iv =
       c->is_client ? tls->enc.server_write_iv : tls->enc.client_write_iv;
 
-  if (tls->recv.len > 0) {
+  if (tls->recv_len > 0) {
     return 0; /* some data from previous record is still present */
   }
   for (;;) {
@@ -9875,18 +9913,30 @@ static int mg_tls_recv_record(struct mg_connection *c) {
   nonce[8] ^= (uint8_t) ((seq >> 24) & 255U);
   nonce[9] ^= (uint8_t) ((seq >> 16) & 255U);
   nonce[10] ^= (uint8_t) ((seq >> 8) & 255U);
-  nonce[11] ^= (uint8_t) ((seq) & 255U);
+  nonce[11] ^= (uint8_t) ((seq) &255U);
 #if CHACHA20
-  uint8_t dec[8192];
-  size_t n = mg_chacha20_poly1305_decrypt(dec, key, nonce, msg, msgsz);
-  memmove(msg, dec, n);
+  {
+    uint8_t *dec = (uint8_t *) malloc(msgsz);
+    size_t n;
+    if (dec == NULL) {
+      mg_error(c, "TLS OOM");
+      return -1;
+    }
+    n = mg_chacha20_poly1305_decrypt(dec, key, nonce, msg, msgsz);
+    memmove(msg, dec, n);
+    free(dec);
+  }
 #else
+  if (msgsz < 16) {
+    mg_error(c, "wrong size");
+    return -1;
+  }
   mg_aes_gcm_decrypt(msg, msg, msgsz - 16, key, 16, nonce, sizeof(nonce));
 #endif
   r = msgsz - 16 - 1;
   tls->content_type = msg[msgsz - 16 - 1];
-  tls->recv.buf = msg;
-  tls->recv.size = tls->recv.len = msgsz - 16 - 1;
+  tls->recv_offset = (size_t) msg - (size_t) rio->buf;
+  tls->recv_len = msgsz - 16 - 1;
   c->is_client ? tls->enc.sseq++ : tls->enc.cseq++;
   return r;
 }
@@ -9944,8 +9994,10 @@ static int mg_tls_server_recv_hello(struct mg_connection *c) {
     MG_INFO(("bad session id len"));
   }
   cipher_suites_len = MG_LOAD_BE16(rio->buf + 44 + session_id_len);
+  if (cipher_suites_len > (rio->len - 46 - session_id_len)) goto fail;
   ext_len = MG_LOAD_BE16(rio->buf + 48 + session_id_len + cipher_suites_len);
   ext = rio->buf + 50 + session_id_len + cipher_suites_len;
+  if (ext_len > (rio->len - 50 - session_id_len - cipher_suites_len)) goto fail;
   for (j = 0; j < ext_len;) {
     uint16_t k;
     uint16_t key_exchange_len;
@@ -9956,10 +10008,14 @@ static int mg_tls_server_recv_hello(struct mg_connection *c) {
       j += (uint16_t) (n + 4);
       continue;
     }
-    key_exchange_len = MG_LOAD_BE16(ext + j + 5);
+    key_exchange_len = MG_LOAD_BE16(ext + j + 4);
     key_exchange = ext + j + 6;
+    if (key_exchange_len >
+        rio->len - (uint16_t) ((size_t) key_exchange - (size_t) rio->buf) - 2)
+      goto fail;
     for (k = 0; k < key_exchange_len;) {
       uint16_t m = MG_LOAD_BE16(key_exchange + k + 2);
+      if (m > (key_exchange_len - k - 4)) goto fail;
       if (m == 32 && key_exchange[k] == 0x00 && key_exchange[k + 1] == 0x1d) {
         memmove(tls->x25519_cli, key_exchange + k + 4, m);
         mg_tls_drop_record(c);
@@ -9969,6 +10025,7 @@ static int mg_tls_server_recv_hello(struct mg_connection *c) {
     }
     j += (uint16_t) (n + 4);
   }
+fail:
   mg_error(c, "bad client hello");
   return -1;
 }
@@ -10141,6 +10198,7 @@ static void mg_tls_server_send_finish(struct mg_connection *c) {
 
 static int mg_tls_server_recv_finish(struct mg_connection *c) {
   struct tls_data *tls = (struct tls_data *) c->tls;
+  unsigned char *recv_buf;
   // we have to backup sha256 value to restore it later, since Finished record
   // is exceptional and is not supposed to be added to the rolling hash
   // calculation.
@@ -10148,8 +10206,9 @@ static int mg_tls_server_recv_finish(struct mg_connection *c) {
   if (mg_tls_recv_record(c) < 0) {
     return -1;
   }
-  if (tls->recv.buf[0] != MG_TLS_FINISHED) {
-    mg_error(c, "expected Finish but got msg 0x%02x", tls->recv.buf[0]);
+  recv_buf = &c->rtls.buf[tls->recv_offset];
+  if (recv_buf[0] != MG_TLS_FINISHED) {
+    mg_error(c, "expected Finish but got msg 0x%02x", recv_buf[0]);
     return -1;
   }
   mg_tls_drop_message(c);
@@ -10287,6 +10346,7 @@ static int mg_tls_client_recv_hello(struct mg_connection *c) {
 
   ext_len = MG_LOAD_BE16(rio->buf + 5 + 39 + 32 + 3);
   ext = rio->buf + 5 + 39 + 32 + 3 + 2;
+  if (ext_len > (rio->len - (5 + 39 + 32 + 3 + 2))) goto fail;
 
   for (j = 0; j < ext_len;) {
     uint16_t ext_type = MG_LOAD_BE16(ext + j);
@@ -10294,6 +10354,7 @@ static int mg_tls_client_recv_hello(struct mg_connection *c) {
     uint16_t group;
     uint8_t *key_exchange;
     uint16_t key_exchange_len;
+    if (ext_len2 > (ext_len - j - 4)) goto fail;
     if (ext_type != 0x0033) {  // not a key share extension, ignore
       j += (uint16_t) (ext_len2 + 4);
       continue;
@@ -10316,18 +10377,20 @@ static int mg_tls_client_recv_hello(struct mg_connection *c) {
     mg_tls_generate_handshake_keys(c);
     return 0;
   }
+fail:
   mg_error(c, "bad client hello");
   return -1;
 }
 
 static int mg_tls_client_recv_ext(struct mg_connection *c) {
   struct tls_data *tls = (struct tls_data *) c->tls;
+  unsigned char *recv_buf;
   if (mg_tls_recv_record(c) < 0) {
     return -1;
   }
-  if (tls->recv.buf[0] != MG_TLS_ENCRYPTED_EXTENSIONS) {
-    mg_error(c, "expected server extensions but got msg 0x%02x",
-             tls->recv.buf[0]);
+  recv_buf = &c->rtls.buf[tls->recv_offset];
+  if (recv_buf[0] != MG_TLS_ENCRYPTED_EXTENSIONS) {
+    mg_error(c, "expected server extensions but got msg 0x%02x", recv_buf[0]);
     return -1;
   }
   mg_tls_drop_message(c);
@@ -10340,18 +10403,19 @@ static int mg_tls_client_recv_cert(struct mg_connection *c) {
   struct mg_der_tlv oid, pubkey, seq, subj;
   int subj_match = 0;
   struct tls_data *tls = (struct tls_data *) c->tls;
+  unsigned char *recv_buf;
   if (mg_tls_recv_record(c) < 0) {
     return -1;
   }
-  if (tls->recv.buf[0] == MG_TLS_CERTIFICATE_REQUEST) {
+  recv_buf = &c->rtls.buf[tls->recv_offset];
+  if (recv_buf[0] == MG_TLS_CERTIFICATE_REQUEST) {
     MG_VERBOSE(("got certificate request"));
     mg_tls_drop_message(c);
     tls->cert_requested = 1;
     return -1;
   }
-  if (tls->recv.buf[0] != MG_TLS_CERTIFICATE) {
-    mg_error(c, "expected server certificate but got msg 0x%02x",
-             tls->recv.buf[0]);
+  if (recv_buf[0] != MG_TLS_CERTIFICATE) {
+    mg_error(c, "expected server certificate but got msg 0x%02x", recv_buf[0]);
     return -1;
   }
   if (tls->skip_verification) {
@@ -10359,15 +10423,15 @@ static int mg_tls_client_recv_cert(struct mg_connection *c) {
     return 0;
   }
 
-  if (tls->recv.len < 11) {
+  if (tls->recv_len < 11) {
     mg_error(c, "certificate list too short");
     return -1;
   }
 
-  cert = tls->recv.buf + 11;
-  certsz = MG_LOAD_BE24(tls->recv.buf + 8);
-  if (certsz > tls->recv.len - 11) {
-    mg_error(c, "certificate too long: %d vs %d", certsz, tls->recv.len - 11);
+  cert = recv_buf + 11;
+  certsz = MG_LOAD_BE24(recv_buf + 8);
+  if (certsz > tls->recv_len - 11) {
+    mg_error(c, "certificate too long: %d vs %d", certsz, tls->recv_len - 11);
     return -1;
   }
 
@@ -10441,12 +10505,13 @@ static int mg_tls_client_recv_cert(struct mg_connection *c) {
 
 static int mg_tls_client_recv_cert_verify(struct mg_connection *c) {
   struct tls_data *tls = (struct tls_data *) c->tls;
+  unsigned char *recv_buf;
   if (mg_tls_recv_record(c) < 0) {
     return -1;
   }
-  if (tls->recv.buf[0] != MG_TLS_CERTIFICATE_VERIFY) {
-    mg_error(c, "expected server certificate verify but got msg 0x%02x",
-             tls->recv.buf[0]);
+  recv_buf = &c->rtls.buf[tls->recv_offset];
+  if (recv_buf[0] != MG_TLS_CERTIFICATE_VERIFY) {
+    mg_error(c, "expected server certificate verify but got msg 0x%02x", recv_buf[0]);
     return -1;
   }
   // Ignore CertificateVerify is strict checks are not required
@@ -10459,7 +10524,7 @@ static int mg_tls_client_recv_cert_verify(struct mg_connection *c) {
   do {
     uint8_t sig[64];
     struct mg_der_tlv seq, a, b;
-    if (mg_der_to_tlv(tls->recv.buf + 8, tls->recv.len - 8, &seq) < 0) {
+    if (mg_der_to_tlv(recv_buf + 8, tls->recv_len - 8, &seq) < 0) {
       mg_error(c, "verification message is not an ASN.1 DER sequence");
       return -1;
     }
@@ -10497,12 +10562,13 @@ static int mg_tls_client_recv_cert_verify(struct mg_connection *c) {
 
 static int mg_tls_client_recv_finish(struct mg_connection *c) {
   struct tls_data *tls = (struct tls_data *) c->tls;
+  unsigned char *recv_buf;
   if (mg_tls_recv_record(c) < 0) {
     return -1;
   }
-  if (tls->recv.buf[0] != MG_TLS_FINISHED) {
-    mg_error(c, "expected server finished but got msg 0x%02x",
-             tls->recv.buf[0]);
+  recv_buf = &c->rtls.buf[tls->recv_offset];
+  if (recv_buf[0] != MG_TLS_FINISHED) {
+    mg_error(c, "expected server finished but got msg 0x%02x", recv_buf[0]);
     return -1;
   }
   mg_tls_drop_message(c);
@@ -10578,7 +10644,9 @@ static void mg_tls_client_handshake(struct mg_connection *c) {
       tls->state = MG_TLS_STATE_CLIENT_CONNECTED;
       c->is_tls_hs = 0;
       break;
-    default: mg_error(c, "unexpected client state: %d", tls->state); break;
+    default:
+      mg_error(c, "unexpected client state: %d", tls->state);
+      break;
   }
 }
 
@@ -10605,7 +10673,9 @@ static void mg_tls_server_handshake(struct mg_connection *c) {
       tls->state = MG_TLS_STATE_SERVER_CONNECTED;
       c->is_tls_hs = 0;
       return;
-    default: mg_error(c, "unexpected server state: %d", tls->state); break;
+    default:
+      mg_error(c, "unexpected server state: %d", tls->state);
+      break;
   }
 }
 
@@ -10622,7 +10692,7 @@ static int mg_parse_pem(const struct mg_str pem, const struct mg_str label,
   size_t n = 0, m = 0;
   char *s;
   const char *c;
-  struct mg_str caps[5];
+  struct mg_str caps[6];  // number of wildcards + 1
   if (!mg_match(pem, mg_str("#-----BEGIN #-----#-----END #-----#"), caps)) {
     *der = mg_strdup(pem);
     return 0;
@@ -10672,6 +10742,7 @@ void mg_tls_init(struct mg_connection *c, const struct mg_tls_opts *opts) {
   if (opts->name.len > 0) {
     if (opts->name.len >= sizeof(tls->hostname) - 1) {
       mg_error(c, "hostname too long");
+      return;
     }
     strncpy((char *) tls->hostname, opts->name.buf, sizeof(tls->hostname) - 1);
     tls->hostname[opts->name.len] = 0;
@@ -10743,23 +10814,25 @@ long mg_tls_send(struct mg_connection *c, const void *buf, size_t len) {
 long mg_tls_recv(struct mg_connection *c, void *buf, size_t len) {
   int r = 0;
   struct tls_data *tls = (struct tls_data *) c->tls;
+  unsigned char *recv_buf;
   size_t minlen;
 
   r = mg_tls_recv_record(c);
   if (r < 0) {
     return r;
   }
+  recv_buf = &c->rtls.buf[tls->recv_offset];
 
   if (tls->content_type != MG_TLS_APP_DATA) {
-    tls->recv.len = 0;
+    tls->recv_len = 0;
     mg_tls_drop_record(c);
     return MG_IO_WAIT;
   }
-  minlen = len < tls->recv.len ? len : tls->recv.len;
-  memmove(buf, tls->recv.buf, minlen);
-  tls->recv.buf += minlen;
-  tls->recv.len -= minlen;
-  if (tls->recv.len == 0) {
+  minlen = len < tls->recv_len ? len : tls->recv_len;
+  memmove(buf, recv_buf, minlen);
+  tls->recv_offset += minlen;
+  tls->recv_len -= minlen;
+  if (tls->recv_len == 0) {
     mg_tls_drop_record(c);
   }
   return (long) minlen;
@@ -10935,6 +11008,7 @@ static void initialize_state(uint32_t state[CHACHA20_STATE_WORDS],
 
 static void core_block(const uint32_t *restrict start,
                        uint32_t *restrict output) {
+  int i;
 // instead of working on the output array,
 // we let the compiler allocate 16 local variables on the stack
 #define __LV(i) uint32_t __t##i = start[i];
@@ -10942,7 +11016,7 @@ static void core_block(const uint32_t *restrict start,
 
 #define __Q(a, b, c, d) Qround(__t##a, __t##b, __t##c, __t##d)
 
-  for (int i = 0; i < 10; i++) {
+  for (i = 0; i < 10; i++) {
     __Q(0, 4, 8, 12);
     __Q(1, 5, 9, 13);
     __Q(2, 6, 10, 14);
@@ -10957,7 +11031,7 @@ static void core_block(const uint32_t *restrict start,
   TIMES16(__FIN)
 }
 
-#define U8(x) ((uint8_t) ((x) & 0xFF))
+#define U8(x) ((uint8_t) ((x) &0xFF))
 
 #ifdef FAST_PATH
 #define xor32_le(dst, src, pad)            \
@@ -10975,15 +11049,15 @@ static void core_block(const uint32_t *restrict start,
 
 #define index8_32(a, ix) ((a) + ((ix) * sizeof(uint32_t)))
 
-#define xor32_blocks(dest, source, pad, words)                          \
-  for (unsigned int __i = 0; __i < words; __i++) {                      \
-    xor32_le(index8_32(dest, __i), index8_32(source, __i), (pad) + __i) \
+#define xor32_blocks(dest, source, pad, words)                    \
+  for (i = 0; i < words; i++) {                                   \
+    xor32_le(index8_32(dest, i), index8_32(source, i), (pad) + i) \
   }
 
 static void xor_block(uint8_t *restrict dest, const uint8_t *restrict source,
                       const uint32_t *restrict pad, unsigned int chunk_size) {
-  unsigned int full_blocks = chunk_size / sizeof(uint32_t);
-  // have to be carefull, we are going back from uint32 to uint8, so endianess
+  unsigned int i, full_blocks = chunk_size / (unsigned int) sizeof(uint32_t);
+  // have to be carefull, we are going back from uint32 to uint8, so endianness
   // matters again
   xor32_blocks(dest, source, pad, full_blocks)
 
@@ -10992,7 +11066,9 @@ static void xor_block(uint8_t *restrict dest, const uint8_t *restrict source,
   pad += full_blocks;
 
   switch (chunk_size % sizeof(uint32_t)) {
-    case 1: dest[0] = source[0] ^ U8(*pad); break;
+    case 1:
+      dest[0] = source[0] ^ U8(*pad);
+      break;
     case 2:
       dest[0] = source[0] ^ U8(*pad);
       dest[1] = source[1] ^ U8(*pad >> 8);
@@ -11011,21 +11087,20 @@ static void chacha20_xor_stream(uint8_t *restrict dest,
                                 const uint8_t nonce[CHACHA20_NONCE_SIZE],
                                 uint32_t counter) {
   uint32_t state[CHACHA20_STATE_WORDS];
-  initialize_state(state, key, nonce, counter);
-
   uint32_t pad[CHACHA20_STATE_WORDS];
-  size_t full_blocks = length / CHACHA20_BLOCK_SIZE;
-  for (size_t b = 0; b < full_blocks; b++) {
+  size_t i, b, last_block, full_blocks = length / CHACHA20_BLOCK_SIZE;
+  initialize_state(state, key, nonce, counter);
+  for (b = 0; b < full_blocks; b++) {
     core_block(state, pad);
     increment_counter(state);
     xor32_blocks(dest, source, pad, CHACHA20_STATE_WORDS) dest +=
         CHACHA20_BLOCK_SIZE;
     source += CHACHA20_BLOCK_SIZE;
   }
-  unsigned int last_block = (unsigned int) (length % CHACHA20_BLOCK_SIZE);
+  last_block = length % CHACHA20_BLOCK_SIZE;
   if (last_block > 0) {
     core_block(state, pad);
-    xor_block(dest, source, pad, last_block);
+    xor_block(dest, source, pad, (unsigned int) last_block);
   }
 }
 
@@ -11038,9 +11113,9 @@ static void chacha20_xor_stream(uint8_t *restrict dest,
   (target)[2] = U8(*(source) >> 16); \
   (target)[3] = U8(*(source) >> 24);
 
-#define serialize(poly_key, result)                          \
-  for (unsigned int i = 0; i < 32 / sizeof(uint32_t); i++) { \
-    store32_le(index8_32(poly_key, i), result + i);          \
+#define serialize(poly_key, result)                 \
+  for (i = 0; i < 32 / sizeof(uint32_t); i++) {     \
+    store32_le(index8_32(poly_key, i), result + i); \
   }
 #endif
 
@@ -11049,9 +11124,11 @@ static void rfc8439_keygen(uint8_t poly_key[32],
                            const uint8_t nonce[CHACHA20_NONCE_SIZE]) {
   uint32_t state[CHACHA20_STATE_WORDS];
   uint32_t result[CHACHA20_STATE_WORDS];
+  size_t i;
   initialize_state(state, key, nonce, 0);
   core_block(state, result);
   serialize(poly_key, result);
+  (void) i;
 }
 // ******* END: chacha-portable.c ********
 // ******* BEGIN: poly1305-donna.c ********
@@ -11076,7 +11153,9 @@ static void rfc8439_keygen(uint8_t poly_key[32],
         based on the public domain reference version in supercop by djb
 static */
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER < 1700
+#define POLY1305_NOINLINE
+#elif defined(_MSC_VER)
 #define POLY1305_NOINLINE __declspec(noinline)
 #elif defined(__GNUC__)
 #define POLY1305_NOINLINE __attribute__((noinline))
@@ -11245,7 +11324,9 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
         poly1305 implementation using 16 bit * 16 bit = 32 bit multiplication
 and 32 bit addition static */
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER < 1700
+#define POLY1305_NOINLINE
+#elif defined(_MSC_VER)
 #define POLY1305_NOINLINE __declspec(noinline)
 #elif defined(__GNUC__)
 #define POLY1305_NOINLINE __attribute__((noinline))
@@ -11275,7 +11356,7 @@ static unsigned short U8TO16(const unsigned char *p) {
 /* store a 16 bit unsigned integer as two 8 bit unsigned integers in little
  * endian */
 static void U16TO8(unsigned char *p, unsigned short v) {
-  p[0] = (v) & 0xff;
+  p[0] = (v) &0xff;
   p[1] = (v >> 8) & 0xff;
 }
 
@@ -11286,7 +11367,7 @@ static void poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
 
   /* r &= 0xffffffc0ffffffc0ffffffc0fffffff */
   t0 = U8TO16(&key[0]);
-  st->r[0] = (t0) & 0x1fff;
+  st->r[0] = (t0) &0x1fff;
   t1 = U8TO16(&key[2]);
   st->r[1] = ((t0 >> 13) | (t1 << 3)) & 0x1fff;
   t2 = U8TO16(&key[4]);
@@ -11326,7 +11407,7 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
 
     /* h += m[i] */
     t0 = U8TO16(&m[0]);
-    st->h[0] += (t0) & 0x1fff;
+    st->h[0] += (t0) &0x1fff;
     t1 = U8TO16(&m[2]);
     st->h[1] += ((t0 >> 13) | (t1 << 3)) & 0x1fff;
     t2 = U8TO16(&m[4]);
@@ -11454,7 +11535,9 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
         poly1305 implementation using 32 bit * 32 bit = 64 bit multiplication
 and 64 bit addition static */
 
-#if defined(_MSC_VER)
+#if defined(_MSC_VER) && _MSC_VER < 1700
+#define POLY1305_NOINLINE
+#elif defined(_MSC_VER)
 #define POLY1305_NOINLINE __declspec(noinline)
 #elif defined(__GNUC__)
 #define POLY1305_NOINLINE __attribute__((noinline))
@@ -11486,7 +11569,7 @@ static unsigned long U8TO32(const unsigned char *p) {
 /* store a 32 bit unsigned integer as four 8 bit unsigned integers in little
  * endian */
 static void U32TO8(unsigned char *p, unsigned long v) {
-  p[0] = (unsigned char) ((v) & 0xff);
+  p[0] = (unsigned char) ((v) &0xff);
   p[1] = (unsigned char) ((v >> 8) & 0xff);
   p[2] = (unsigned char) ((v >> 16) & 0xff);
   p[3] = (unsigned char) ((v >> 24) & 0xff);
@@ -11525,7 +11608,7 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
   unsigned long r0, r1, r2, r3, r4;
   unsigned long s1, s2, s3, s4;
   unsigned long h0, h1, h2, h3, h4;
-  unsigned long long d0, d1, d2, d3, d4;
+  uint64_t d0, d1, d2, d3, d4;
   unsigned long c;
 
   r0 = st->r[0];
@@ -11554,21 +11637,16 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
     h4 += (U8TO32(m + 12) >> 8) | hibit;
 
     /* h *= r */
-    d0 = ((unsigned long long) h0 * r0) + ((unsigned long long) h1 * s4) +
-         ((unsigned long long) h2 * s3) + ((unsigned long long) h3 * s2) +
-         ((unsigned long long) h4 * s1);
-    d1 = ((unsigned long long) h0 * r1) + ((unsigned long long) h1 * r0) +
-         ((unsigned long long) h2 * s4) + ((unsigned long long) h3 * s3) +
-         ((unsigned long long) h4 * s2);
-    d2 = ((unsigned long long) h0 * r2) + ((unsigned long long) h1 * r1) +
-         ((unsigned long long) h2 * r0) + ((unsigned long long) h3 * s4) +
-         ((unsigned long long) h4 * s3);
-    d3 = ((unsigned long long) h0 * r3) + ((unsigned long long) h1 * r2) +
-         ((unsigned long long) h2 * r1) + ((unsigned long long) h3 * r0) +
-         ((unsigned long long) h4 * s4);
-    d4 = ((unsigned long long) h0 * r4) + ((unsigned long long) h1 * r3) +
-         ((unsigned long long) h2 * r2) + ((unsigned long long) h3 * r1) +
-         ((unsigned long long) h4 * r0);
+    d0 = ((uint64_t) h0 * r0) + ((uint64_t) h1 * s4) + ((uint64_t) h2 * s3) +
+         ((uint64_t) h3 * s2) + ((uint64_t) h4 * s1);
+    d1 = ((uint64_t) h0 * r1) + ((uint64_t) h1 * r0) + ((uint64_t) h2 * s4) +
+         ((uint64_t) h3 * s3) + ((uint64_t) h4 * s2);
+    d2 = ((uint64_t) h0 * r2) + ((uint64_t) h1 * r1) + ((uint64_t) h2 * r0) +
+         ((uint64_t) h3 * s4) + ((uint64_t) h4 * s3);
+    d3 = ((uint64_t) h0 * r3) + ((uint64_t) h1 * r2) + ((uint64_t) h2 * r1) +
+         ((uint64_t) h3 * r0) + ((uint64_t) h4 * s4);
+    d4 = ((uint64_t) h0 * r4) + ((uint64_t) h1 * r3) + ((uint64_t) h2 * r2) +
+         ((uint64_t) h3 * r1) + ((uint64_t) h4 * r0);
 
     /* (partial) h %= p */
     c = (unsigned long) (d0 >> 26);
@@ -11606,7 +11684,7 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
   poly1305_state_internal_t *st = (poly1305_state_internal_t *) ctx;
   unsigned long h0, h1, h2, h3, h4, c;
   unsigned long g0, g1, g2, g3, g4;
-  unsigned long long f;
+  uint64_t f;
   unsigned long mask;
 
   /* process the remaining block */
@@ -11677,13 +11755,13 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
   h3 = ((h3 >> 18) | (h4 << 8)) & 0xffffffff;
 
   /* mac = (h + pad) % (2^128) */
-  f = (unsigned long long) h0 + st->pad[0];
+  f = (uint64_t) h0 + st->pad[0];
   h0 = (unsigned long) f;
-  f = (unsigned long long) h1 + st->pad[1] + (f >> 32);
+  f = (uint64_t) h1 + st->pad[1] + (f >> 32);
   h1 = (unsigned long) f;
-  f = (unsigned long long) h2 + st->pad[2] + (f >> 32);
+  f = (uint64_t) h2 + st->pad[2] + (f >> 32);
   h2 = (unsigned long) f;
-  f = (unsigned long long) h3 + st->pad[3] + (f >> 32);
+  f = (uint64_t) h3 + st->pad[3] + (f >> 32);
   h3 = (unsigned long) f;
 
   U32TO8(mac + 0, h0);
@@ -11723,20 +11801,24 @@ typedef struct uint128_t {
 #define MUL128(out, x, y) out.lo = _umul128((x), (y), &out.hi)
 #define ADD(out, in)                \
   {                                 \
-    unsigned long long t = out.lo;  \
+    uint64_t t = out.lo;            \
     out.lo += in.lo;                \
     out.hi += (out.lo < t) + in.hi; \
   }
-#define ADDLO(out, in)             \
-  {                                \
-    unsigned long long t = out.lo; \
-    out.lo += in;                  \
-    out.hi += (out.lo < t);        \
+#define ADDLO(out, in)      \
+  {                         \
+    uint64_t t = out.lo;    \
+    out.lo += in;           \
+    out.hi += (out.lo < t); \
   }
 #define SHR(in, shift) (__shiftright128(in.lo, in.hi, (shift)))
 #define LO(in) (in.lo)
 
+#if defined(_MSC_VER) && _MSC_VER < 1700
+#define POLY1305_NOINLINE
+#else
 #define POLY1305_NOINLINE __declspec(noinline)
+#endif
 #elif defined(__GNUC__)
 #if defined(__SIZEOF_INT128__)
 // Get rid of GCC warning "ISO C does not support '__int128' types"
@@ -11751,19 +11833,19 @@ typedef unsigned uint128_t __attribute__((mode(TI)));
 #define MUL128(out, x, y) out = ((uint128_t) x * y)
 #define ADD(out, in) out += in
 #define ADDLO(out, in) out += in
-#define SHR(in, shift) (unsigned long long) (in >> (shift))
-#define LO(in) (unsigned long long) (in)
+#define SHR(in, shift) (uint64_t)(in >> (shift))
+#define LO(in) (uint64_t)(in)
 
 #define POLY1305_NOINLINE __attribute__((noinline))
 #endif
 
 #define poly1305_block_size 16
 
-/* 17 + sizeof(size_t) + 8*sizeof(unsigned long long) */
+/* 17 + sizeof(size_t) + 8*sizeof(uint64_t) */
 typedef struct poly1305_state_internal_t {
-  unsigned long long r[3];
-  unsigned long long h[3];
-  unsigned long long pad[2];
+  uint64_t r[3];
+  uint64_t h[3];
+  uint64_t pad[2];
   size_t leftover;
   unsigned char buffer[poly1305_block_size];
   unsigned char final;
@@ -11771,21 +11853,17 @@ typedef struct poly1305_state_internal_t {
 
 /* interpret eight 8 bit unsigned integers as a 64 bit unsigned integer in
  * little endian */
-static unsigned long long U8TO64(const unsigned char *p) {
-  return (((unsigned long long) (p[0] & 0xff)) |
-          ((unsigned long long) (p[1] & 0xff) << 8) |
-          ((unsigned long long) (p[2] & 0xff) << 16) |
-          ((unsigned long long) (p[3] & 0xff) << 24) |
-          ((unsigned long long) (p[4] & 0xff) << 32) |
-          ((unsigned long long) (p[5] & 0xff) << 40) |
-          ((unsigned long long) (p[6] & 0xff) << 48) |
-          ((unsigned long long) (p[7] & 0xff) << 56));
+static uint64_t U8TO64(const unsigned char *p) {
+  return (((uint64_t) (p[0] & 0xff)) | ((uint64_t) (p[1] & 0xff) << 8) |
+          ((uint64_t) (p[2] & 0xff) << 16) | ((uint64_t) (p[3] & 0xff) << 24) |
+          ((uint64_t) (p[4] & 0xff) << 32) | ((uint64_t) (p[5] & 0xff) << 40) |
+          ((uint64_t) (p[6] & 0xff) << 48) | ((uint64_t) (p[7] & 0xff) << 56));
 }
 
 /* store a 64 bit unsigned integer as eight 8 bit unsigned integers in little
  * endian */
-static void U64TO8(unsigned char *p, unsigned long long v) {
-  p[0] = (unsigned char) ((v) & 0xff);
+static void U64TO8(unsigned char *p, uint64_t v) {
+  p[0] = (unsigned char) ((v) &0xff);
   p[1] = (unsigned char) ((v >> 8) & 0xff);
   p[2] = (unsigned char) ((v >> 16) & 0xff);
   p[3] = (unsigned char) ((v >> 24) & 0xff);
@@ -11797,13 +11875,13 @@ static void U64TO8(unsigned char *p, unsigned long long v) {
 
 static void poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
   poly1305_state_internal_t *st = (poly1305_state_internal_t *) ctx;
-  unsigned long long t0, t1;
+  uint64_t t0, t1;
 
   /* r &= 0xffffffc0ffffffc0ffffffc0fffffff */
   t0 = U8TO64(&key[0]);
   t1 = U8TO64(&key[8]);
 
-  st->r[0] = (t0) & 0xffc0fffffff;
+  st->r[0] = (t0) &0xffc0fffffff;
   st->r[1] = ((t0 >> 44) | (t1 << 20)) & 0xfffffc0ffff;
   st->r[2] = ((t1 >> 24)) & 0x00ffffffc0f;
 
@@ -11822,12 +11900,11 @@ static void poly1305_init(poly1305_context *ctx, const unsigned char key[32]) {
 
 static void poly1305_blocks(poly1305_state_internal_t *st,
                             const unsigned char *m, size_t bytes) {
-  const unsigned long long hibit =
-      (st->final) ? 0 : ((unsigned long long) 1 << 40); /* 1 << 128 */
-  unsigned long long r0, r1, r2;
-  unsigned long long s1, s2;
-  unsigned long long h0, h1, h2;
-  unsigned long long c;
+  const uint64_t hibit = (st->final) ? 0 : ((uint64_t) 1 << 40); /* 1 << 128 */
+  uint64_t r0, r1, r2;
+  uint64_t s1, s2;
+  uint64_t h0, h1, h2;
+  uint64_t c;
   uint128_t d0, d1, d2, d;
 
   r0 = st->r[0];
@@ -11842,13 +11919,13 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
   s2 = r2 * (5 << 2);
 
   while (bytes >= poly1305_block_size) {
-    unsigned long long t0, t1;
+    uint64_t t0, t1;
 
     /* h += m[i] */
     t0 = U8TO64(&m[0]);
     t1 = U8TO64(&m[8]);
 
-    h0 += ((t0) & 0xfffffffffff);
+    h0 += ((t0) &0xfffffffffff);
     h1 += (((t0 >> 44) | (t1 << 20)) & 0xfffffffffff);
     h2 += (((t1 >> 24)) & 0x3ffffffffff) | hibit;
 
@@ -11895,9 +11972,9 @@ static void poly1305_blocks(poly1305_state_internal_t *st,
 static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
                                               unsigned char mac[16]) {
   poly1305_state_internal_t *st = (poly1305_state_internal_t *) ctx;
-  unsigned long long h0, h1, h2, c;
-  unsigned long long g0, g1, g2;
-  unsigned long long t0, t1;
+  uint64_t h0, h1, h2, c;
+  uint64_t g0, g1, g2;
+  uint64_t t0, t1;
 
   /* process the remaining block */
   if (st->leftover) {
@@ -11939,10 +12016,10 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
   g1 = h1 + c;
   c = (g1 >> 44);
   g1 &= 0xfffffffffff;
-  g2 = h2 + c - ((unsigned long long) 1 << 42);
+  g2 = h2 + c - ((uint64_t) 1 << 42);
 
   /* select h if h < p, or h + -p if h >= p */
-  c = (g2 >> ((sizeof(unsigned long long) * 8) - 1)) - 1;
+  c = (g2 >> ((sizeof(uint64_t) * 8) - 1)) - 1;
   g0 &= c;
   g1 &= c;
   g2 &= c;
@@ -11955,7 +12032,7 @@ static POLY1305_NOINLINE void poly1305_finish(poly1305_context *ctx,
   t0 = st->pad[0];
   t1 = st->pad[1];
 
-  h0 += ((t0) & 0xfffffffffff);
+  h0 += ((t0) &0xfffffffffff);
   c = (h0 >> 44);
   h0 &= 0xfffffffffff;
   h1 += (((t0 >> 44) | (t1 << 20)) & 0xfffffffffff) + c;
@@ -12032,7 +12109,7 @@ static PORTABLE_8439_DECL void pad_if_needed(poly1305_context *ctx,
   }
 }
 
-#define __u8(v) ((uint8_t) ((v) & 0xFF))
+#define __u8(v) ((uint8_t) ((v) &0xFF))
 
 // TODO: make this depending on the unaligned/native read size possible
 static PORTABLE_8439_DECL void write_64bit_int(poly1305_context *ctx,
@@ -12056,9 +12133,9 @@ static PORTABLE_8439_DECL void poly1305_calculate_mac(
     size_t ad_size) {
   // init poly key (section 2.6)
   uint8_t poly_key[__POLY1305_KEY_SIZE] = {0};
+  poly1305_context poly_ctx;
   rfc8439_keygen(poly_key, key, nonce);
   // start poly1305 mac
-  poly1305_context poly_ctx;
   poly1305_init(&poly_ctx, poly_key);
 
   if (ad != NULL && ad_size > 0) {
@@ -12429,8 +12506,9 @@ static STACK_OF(X509_INFO) * load_ca_certs(struct mg_str ca) {
 }
 
 static bool add_ca_certs(SSL_CTX *ctx, STACK_OF(X509_INFO) * certs) {
+  int i;
   X509_STORE *cert_store = SSL_CTX_get_cert_store(ctx);
-  for (int i = 0; i < sk_X509_INFO_num(certs); i++) {
+  for (i = 0; i < sk_X509_INFO_num(certs); i++) {
     X509_INFO *cert_info = sk_X509_INFO_value(certs, i);
     if (cert_info->x509 && !X509_STORE_add_cert(cert_store, cert_info->x509))
       return false;
@@ -12526,8 +12604,12 @@ void mg_tls_init(struct mg_connection *c, const struct mg_tls_opts *opts) {
     s_initialised++;
   }
   MG_DEBUG(("%lu Setting TLS", c->id));
-  tls->ctx = c->is_client ? SSL_CTX_new(SSLv23_client_method())
-                          : SSL_CTX_new(SSLv23_server_method());
+  tls->ctx = c->is_client ? SSL_CTX_new(TLS_client_method())
+                          : SSL_CTX_new(TLS_server_method());
+  if (tls->ctx == NULL) {
+    mg_error(c, "SSL_CTX_new");
+    goto fail;
+  }
 #ifdef MG_TLS_SSLKEYLOGFILE
   SSL_CTX_set_keylog_callback(tls->ctx, ssl_keylog_cb);
 #endif
@@ -12692,8 +12774,8 @@ void mg_tls_ctx_free(struct mg_mgr *mgr) {
 #if (MG_UECC_PLATFORM == mg_uecc_avr) || (MG_UECC_PLATFORM == mg_uecc_arm) || \
     (MG_UECC_PLATFORM == mg_uecc_arm_thumb) ||                                \
     (MG_UECC_PLATFORM == mg_uecc_arm_thumb2)
-#define CONCATX(a, ...) a##__VA_ARGS__
-#define CONCAT(a, ...) CONCATX(a, __VA_ARGS__)
+#define MG_UECC_CONCATX(a, ...) a##__VA_ARGS__
+#define MG_UECC_CONCAT(a, ...) MG_UECC_CONCATX(a, __VA_ARGS__)
 
 #define STRX(a) #a
 #define STR(a) STRX(a)
@@ -12737,32 +12819,32 @@ void mg_tls_ctx_free(struct mg_mgr *mgr) {
 #define DEC_31 30
 #define DEC_32 31
 
-#define DEC(N) CONCAT(DEC_, N)
+#define DEC(N) MG_UECC_CONCAT(DEC_, N)
 
 #define SECOND_ARG(_, val, ...) val
 #define SOME_CHECK_0 ~, 0
 #define GET_SECOND_ARG(...) SECOND_ARG(__VA_ARGS__, SOME, )
-#define SOME_OR_0(N) GET_SECOND_ARG(CONCAT(SOME_CHECK_, N))
+#define SOME_OR_0(N) GET_SECOND_ARG(MG_UECC_CONCAT(SOME_CHECK_, N))
 
-#define EMPTY(...)
-#define DEFER(...) __VA_ARGS__ EMPTY()
+#define MG_UECC_EMPTY(...)
+#define DEFER(...) __VA_ARGS__ MG_UECC_EMPTY()
 
 #define REPEAT_NAME_0() REPEAT_0
 #define REPEAT_NAME_SOME() REPEAT_SOME
 #define REPEAT_0(...)
 #define REPEAT_SOME(N, stuff) \
-  DEFER(CONCAT(REPEAT_NAME_, SOME_OR_0(DEC(N))))()(DEC(N), stuff) stuff
+  DEFER(MG_UECC_CONCAT(REPEAT_NAME_, SOME_OR_0(DEC(N))))()(DEC(N), stuff) stuff
 #define REPEAT(N, stuff) EVAL(REPEAT_SOME(N, stuff))
 
 #define REPEATM_NAME_0() REPEATM_0
 #define REPEATM_NAME_SOME() REPEATM_SOME
 #define REPEATM_0(...)
 #define REPEATM_SOME(N, macro) \
-  macro(N) DEFER(CONCAT(REPEATM_NAME_, SOME_OR_0(DEC(N))))()(DEC(N), macro)
+  macro(N) DEFER(MG_UECC_CONCAT(REPEATM_NAME_, SOME_OR_0(DEC(N))))()(DEC(N), macro)
 #define REPEATM(N, macro) EVAL(REPEATM_SOME(N, macro))
 #endif
 
-//
+// 
 
 #if (MG_UECC_WORD_SIZE == 1)
 #if MG_UECC_SUPPORTS_secp160r1
@@ -16558,9 +16640,9 @@ size_t mg_ws_send(struct mg_connection *c, const void *buf, size_t len,
                   int op) {
   uint8_t header[14];
   size_t header_len = mkhdr(len, op, c->is_client, header);
-  mg_send(c, header, header_len);
+  if (!mg_send(c, header, header_len)) return 0;
+  if (!mg_send(c, buf, len)) return header_len;
   MG_VERBOSE(("WS out: %d [%.*s]", (int) len, (int) len, buf));
-  mg_send(c, buf, len);
   mg_ws_mask(c, len);
   return header_len + len;
 }
@@ -16712,12 +16794,12 @@ size_t mg_ws_wrap(struct mg_connection *c, size_t len, int op) {
   size_t header_len = mkhdr(len, op, c->is_client, header);
 
   // NOTE: order of operations is important!
-  mg_iobuf_add(&c->send, c->send.len, NULL, header_len);
-  p = &c->send.buf[c->send.len - len];         // p points to data
-  memmove(p, p - header_len, len);             // Shift data
-  memcpy(p - header_len, header, header_len);  // Prepend header
-  mg_ws_mask(c, len);                          // Mask data
-
+  if (mg_iobuf_add(&c->send, c->send.len, NULL, header_len) != 0) {
+    p = &c->send.buf[c->send.len - len];         // p points to data
+    memmove(p, p - header_len, len);             // Shift data
+    memcpy(p - header_len, header, header_len);  // Prepend header
+    mg_ws_mask(c, len);                          // Mask data
+  }
   return c->send.len;
 }
 
@@ -16941,7 +17023,7 @@ static bool mg_tcpip_driver_imxrt_init(struct mg_tcpip_if *ifp) {
   int cr = (d == NULL || d->mdc_cr < 0) ? 24 : d->mdc_cr;
   ENET->MSCR = (1 << 8) | ((cr & 0x3f) << 1);  // HOLDTIME 2 clks
   struct mg_phy phy = {enet_read_phy, enet_write_phy};
-  mg_phy_init(&phy, d->phy_addr, MG_PHY_LEDS_ACTIVE_HIGH); // MAC clocks PHY
+  mg_phy_init(&phy, d->phy_addr, MG_PHY_LEDS_ACTIVE_HIGH); // MAC clocks PHY  
   // Select RMII mode, 100M, keep CRC, set max rx length, disable loop
   ENET->RCR = (1518 << 16) | MG_BIT(8) | MG_BIT(2);
   // ENET->RCR |= MG_BIT(3);     // Receive all
@@ -17097,7 +17179,7 @@ void mg_phy_init(struct mg_phy *phy, uint8_t phy_addr, uint8_t config) {
   MG_INFO(("PHY ID: %#04x %#04x (%s)", id1, id2, mg_phy_id_to_str(id1, id2)));
 
   if (id1 == MG_PHY_DP83x && id2 == MG_PHY_DP83867) {
-    phy->write_reg(phy_addr, 0x0d, 0x1f);    // write 0x10d to IO_MUX_CFG (0x0170)
+    phy->write_reg(phy_addr, 0x0d, 0x1f);  // write 0x10d to IO_MUX_CFG (0x0170)
     phy->write_reg(phy_addr, 0x0e, 0x170);
     phy->write_reg(phy_addr, 0x0d, 0x401f);
     phy->write_reg(phy_addr, 0x0e, 0x10d);
@@ -17111,7 +17193,11 @@ void mg_phy_init(struct mg_phy *phy, uint8_t phy_addr, uint8_t config) {
     if (id1 == MG_PHY_DP83x && id2 != MG_PHY_DP83867) {
       phy->write_reg(phy_addr, MG_PHY_DP83x_REG_RCSR, MG_BIT(7) | MG_BIT(0));
     } else if (id1 == MG_PHY_KSZ8x) {
-      phy->write_reg(phy_addr, MG_PHY_KSZ8x_REG_PC2R,
+      // Disable isolation (override hw, it doesn't make sense at this point)
+      phy->write_reg(  // #2848, some NXP boards set ISO, even though
+          phy_addr, MG_PHY_REG_BCR,  // docs say they don't
+          phy->read_reg(phy_addr, MG_PHY_REG_BCR) & (uint16_t) ~MG_BIT(10));
+      phy->write_reg(phy_addr, MG_PHY_KSZ8x_REG_PC2R,  // now do clock stuff
                      MG_BIT(15) | MG_BIT(8) | MG_BIT(7));
     } else if (id1 == MG_PHY_LAN87x) {
       // nothing to do
@@ -18559,7 +18645,7 @@ static bool mg_tcpip_driver_xmc_init(struct mg_tcpip_if *ifp) {
 
   // set the MAC address
   ETH0->MAC_ADDRESS0_HIGH = MG_U32(0, 0, ifp->mac[5], ifp->mac[4]);
-  ETH0->MAC_ADDRESS0_LOW =
+  ETH0->MAC_ADDRESS0_LOW = 
         MG_U32(ifp->mac[3], ifp->mac[2], ifp->mac[1], ifp->mac[0]);
 
   // Configure the receive filter
@@ -18931,4 +19017,3 @@ struct mg_tcpip_driver mg_tcpip_driver_xmc7 = {mg_tcpip_driver_xmc7_init,
                                                mg_tcpip_driver_xmc7_tx, NULL,
                                                mg_tcpip_driver_xmc7_up};
 #endif
-
