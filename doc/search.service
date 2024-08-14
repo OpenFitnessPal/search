@@ -1,0 +1,10 @@
+[Unit]
+Description=OpenFitnessPal Search Backend
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/search.conf
+ExecStart=/bin/sh -c '${DBUSBIN}'
+
+[Install]
+WantedBy=multi-user.target
