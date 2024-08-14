@@ -4,11 +4,35 @@ import sys
 
 c = myfitnesspal.Client()
 
-results = c.get_food_search_results(' '.join(sys.argv[1:]))
+args = sys.argv[1:]
+args = ' '.join(args)
+args = args.split('?')
+
+food = args[0]
+queries = {}
+if len(args) > 1:
+    query_str = args[1]
+    query_arr = query_str.split("&")
+
+    for query in query_arr:
+        split = query.split("=")
+
+        if len(split) == 0:
+            continue
+
+        key = split[0]
+
+        if len(split) == 1:
+            queries[key] = True
+        else:
+            value = split[1]
+            queries[key] = value
+
+results = c.get_food_search_results(food)
 
 data = []
 
-for f in results[:10]:
+def process_nutrients(f):
     d = {}
     def field(name, field, default):
         try:
@@ -48,7 +72,11 @@ for f in results[:10]:
     field("vitaminA", "vitamin_a", 0)
     field("vitaminC", "vitamin_c", 0)
 
+    return d
+
+def process_servings(f):
     servings = []
+
     for s in f.servings:
         se = {}
         se["mult"] = s.nutrition_multiplier
@@ -57,8 +85,58 @@ for f in results[:10]:
 
         servings.append(se)
 
-    d["servings"] = servings
+    return servings
+
+#avoid_<nutrient>=<threshold>
+def filter_nutrients(f):
+    for avoid in [q for q in list(queries) if q.startswith('avoid')]:
+        n = '_'.join(avoid.split("_")[1:])
+        if n not in f:
+            continue
+
+        threshold = queries[avoid]
+        if threshold == True:
+            threshold = 0.1
+        else:
+            try:
+                threshold = float(threshold)
+            except:
+                threshold = 0.1
+
+        if threshold < 0.0:
+            threshold = 0.0
+
+        if f[n] > threshold:
+            return False
+    return True
+
+def filter(f):
+    good = True
+    good = filter_nutrients(f)
+    return good
+
+def sort_generics(item):
+    if 'generics' in queries:
+        return item['brand'] == 'Generic' or item['brand'] == ''
+
+def sort():
+    data.sort(reverse=True, key=sort_generics)
+
+i = 0
+idx = 0
+while i < 10:
+    f = results[idx]
+    idx += 1
+
+    d = process_nutrients(f)
+    if not filter(d):
+        continue
+
+    d["servings"] = process_servings(f)
 
     data.append(d)
+    i += 1
+
+sort()
 
 print(str(data).replace("'", '"').replace(u'\\xa0', u' '))

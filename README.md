@@ -23,7 +23,13 @@ git clone https://git.swurl.xyz/swirl/OFPSearch && cd OFPSearch
 make
 ```
 
-3. Now, you need to install. NGINX and systemd files are provided in this project; you may choose not to install them.
+3. Install python-myfitnesspal through pip. This may change depending on your distribution, but generally, `pip install --break-system-packages` may be the only real way.
+
+Alternatively, modify `doc/runSearch.sh` to use a virtualenv.
+
+Furthermore, you will need to be logged in on a browser to MyFitnessPal.
+
+4. Now, you need to install. NGINX and systemd files are provided in this project; you may choose not to install them.
 
 For all install commands, you may optionally provide `prefix` and `DESTDIR` options. This is useful for packagers; i.e. for a PKGBUILD: `make prefix=/usr DESTDIR=${pkgdir} install`.
 
@@ -35,12 +41,12 @@ Available install commands are as follows:
 
 For example, on a non-systemd system using NGINX, you would run `make install-bin install-nginx`.
 
-4. If using systemd, change the environment file to reflect your desired options:
+5. If using systemd, change the environment file to reflect your desired options:
 ```bash
 vim /etc/search.conf
 ```
 
-5. You can now enable and start the service:
+6. You can now enable and start the service:
 ```bash
 systemctl enable --now search
 ```
