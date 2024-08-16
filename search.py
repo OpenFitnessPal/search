@@ -123,9 +123,16 @@ def sort_generics(item):
 def sort():
     data.sort(reverse=True, key=sort_generics)
 
+def num_results():
+    try:
+        return int(queries['results'])
+    except:
+        return 10
+
 i = 0
 idx = 0
-while i < 10:
+n = num_results()
+while i < n:
     if idx >= len(results):
         break
     f = results[idx]
